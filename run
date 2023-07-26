@@ -1,0 +1,150 @@
+import matplotlib.pyplot as plt
+import googlemaps
+import numpy as np
+import utm
+from shapely.geometry import Polygon, Point
+from scipy.interpolate import Rbf
+import requests
+import os
+import ezdxf
+from ezdxf.addons import Importer
+from ezdxf.math import Vec3
+from datetime import datetime
+
+# Replace YOUR_API_KEY with your Google Maps API key
+api_key = 'YOUR_API_KEY'
+
+def generate_contours_within_boundary(api_key, boundary_polygon):
+    # Get the bounds of the input polygon
+    lat_min, lng_min, lat_max, lng_max = boundary_polygon.bounds
+
+    # Create a grid of latitude and longitude coordinates
+    lat_vals = np.linspace(lat_min, lat_max, 100)
+    lng_vals = np.linspace(lng_min, lng_max, 100)
+    lng_grid, lat_grid = np.meshgrid(lng_vals, lat_vals)
+
+    # Use Google Maps Elevation API to get elevations for each grid point
+    gmaps = googlemaps.Client(key=api_key)
+    locations = [{'lat': lat, 'lng': lng} for lat, lng in zip(lat_grid.flatten(), lng_grid.flatten())]
+
+    # Split locations into smaller chunks and fetch elevation data
+    chunk_size = 512
+    elevations = []
+    for i in range(0, len(locations), chunk_size):
+        elevation_data = gmaps.elevation(locations[i:i + chunk_size])
+        elevations.extend([(lat_lng['location']['lat'], lat_lng['location']['lng'], lat_lng['elevation']) for lat_lng in elevation_data])
+
+    elevations = np.array(elevations)
+
+    # Filter points outside the boundary
+    elevations = [e for e in elevations if boundary_polygon.contains(Point(e[0], e[1]))]
+
+    # Convert elevations list to a NumPy array
+    elevations = np.array(elevations)
+
+    # Interpolate the elevations using Radial Basis Function interpolation
+    rbf = Rbf(elevations[:, 0], elevations[:, 1], elevations[:, 2], function='multiquadric', smooth=0.1)
+    elevation_grid = rbf(lat_grid, lng_grid)
+
+    # Generate contours
+    interval_ft = 1  # 1 foot
+    interval_m = interval_ft / 3.28084  # Convert to meters
+    min_elevation = np.floor(np.min(elevation_grid))  # start from the nearest whole number elevation
+    contour_levels = np.arange(min_elevation, np.max(elevation_grid), interval_m)
+    contours = plt.contour(lat_grid, lng_grid, elevation_grid, levels=contour_levels)
+
+    return contours
+
+def contours_to_dxf(contours, dxf_file, scale_factor, translation_vec=(0, 0)):
+    # Create a new DXF document
+    doc = ezdxf.new('R2010')
+
+    # Setup layers
+    doc.layers.new(name='Contour_Lines', dxfattribs={'color': 3})
+    doc.layers.new(name='Annotation', dxfattribs={'color': 2})
+
+    # Add contour lines to the DXF
+    msp = doc.modelspace()
+
+    for level, level_lines in zip(contours.levels, contours.allsegs):
+        for line in level_lines:
+            # Convert to UTM coordinates
+            line_utm = [utm.from_latlon(*coord) for coord in line]
+            line_utm = np.array([(x * scale_factor - translation_vec[0], y * scale_factor - translation_vec[1]) for x, y, _, _ in line_utm])
+            dxf_polyline = msp.add_lwpolyline(line_utm, dxfattribs={'layer': 'Contour_Lines'})
+            dxf_polyline.dxf.elevation = level * scale_factor
+
+            # Add elevation annotation
+            text_height = 3
+            annotation_point = line_utm[0]  # Add annotation at the first point of the contour
+            elevation_ft = round(level * 3.28084)  # round to the nearest whole number
+            elevation_text = f"{elevation_ft:.0f}'"  # change from "ft" to "'" for foot notation
+
+            msp.add_text(elevation_text, dxfattribs={'height': text_height, 'layer': 'Annotation', 'insert': annotation_point})
+
+    # Save the DXF file
+    doc.saveas(dxf_file)
+
+def add_scale_bar(doc, dxf_file, length, height, text_height, insert_point, layer='ScaleBar'):
+    # Retrieve the modelspace
+    msp = doc.modelspace()
+    
+    # Draw a line representing the length
+    start_point = Vec3(insert_point[0], insert_point[1], 0)
+    end_point = Vec3(insert_point[0] + length, insert_point[1], 0)
+    msp.add_line(start_point, end_point, dxfattribs={'layer': layer})
+
+    # Draw two vertical lines at the start and end of the length
+    v_start_point = Vec3(insert_point[0], insert_point[1] - height / 2, 0)
+    v_end_point = Vec3(insert_point[0], insert_point[1] + height / 2, 0)
+    msp.add_line(v_start_point, v_end_point, dxfattribs={'layer': layer})
+
+    v_start_point = Vec3(insert_point[0] + length, insert_point[1] - height / 2, 0)
+    v_end_point = Vec3(insert_point[0] + length, insert_point[1] + height / 2, 0)
+    msp.add_line(v_start_point, v_end_point, dxfattribs={'layer': layer})
+
+    # Add a label for the length
+    label_point = Vec3(insert_point[0] + length / 2, insert_point[1] - text_height * 1.5, 0)
+    msp.add_text(f"{length}'", dxfattribs={'height': text_height, 'layer': layer, 'insert': label_point, 'halign': 1, 'valign': 0})
+    
+    # Save the modified DXF file
+    doc.saveas(dxf_file)
+    
+# Prompt user for two corner coordinates
+print("Enter the two corner coordinates as comma-separated latitudes and longitudes, in the format lat1, lng1, lat2, lng2.")
+corner_coords_input = input()
+corner_coords = list(map(float, corner_coords_input.split(',')))
+lat1, lng1, lat2, lng2 = corner_coords
+boundary_polygon = Polygon([(lat1, lng1), (lat1, lng2), (lat2, lng2), (lat2, lng1)])
+
+# Get the current timestamp
+timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+# Create a unique directory name
+unique_folder = f"output_{timestamp}"
+
+# Create the directory
+os.makedirs(unique_folder, exist_ok=True)
+
+# Get contours
+contours = generate_contours_within_boundary(api_key, boundary_polygon)
+
+# Prepare for DXF creation
+scale_factor = 3.28084  # Scale from meters to feet
+
+# Get the min UTM coordinates of the boundary_polygon
+lat_min, lng_min, _, _ = boundary_polygon.bounds
+x_min, y_min, _, _ = utm.from_latlon(lat_min, lng_min)
+translation_vec = (x_min * scale_factor, y_min * scale_factor)
+
+# Save the contours DXF file
+output_file = f"{unique_folder}/contours_{timestamp}.dxf"
+contours_to_dxf(contours, output_file, scale_factor, translation_vec=translation_vec)
+
+# Add the scale bar (pass 'doc' and 'dxf_file' instead of 'msp')
+scale_bar_insert_point = (10, 10)
+doc = ezdxf.readfile(output_file)
+add_scale_bar(doc, output_file, length=100, height=5, text_height=3, insert_point=scale_bar_insert_point)
+doc.saveas(output_file)
+
+print("Contours have been exported to", output_file)
